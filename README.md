@@ -12,13 +12,13 @@ Claude Code ── skill + availability check + codex queue ──▶ worker 1 /
     └──────────── local Claude peer MCP reply ───────────────┘
 ```
 
-This is a local integration built from a Claude Code skill, the Codex CLI queue, and a separate Claude-peer MCP bridge. It is **not** a built-in ChatGPT Desktop ↔ Claude Code connection, and the skill does not provide the reply MCP server itself. The exact setup demonstrated by the author used Codex Desktop and a local `claude_peers` MCP server exposing `list_claude_sessions` and `send_message_to_claude`.
+This is a local integration built from a Claude Code skill, the Codex CLI queue, and the bundled [Claude-peer MCP bridge](mcp/claude_peers.py). It is **not** a built-in ChatGPT Desktop ↔ Claude Code connection. The bridge exposes `list_claude_sessions` and `send_message_to_claude` to Codex.
 
 ## Requirements
 
 - Claude Code with local peer messaging enabled. The sending session must expose `CLAUDE_CODE_MESSAGING_SOCKET` or have the local `peer-sessions/scripts/peer-addr.py --me --json` identity helper, plus a matching record in `~/.claude/sessions/`.
 - A local Codex CLI whose `codex queue --help` supports `--thread` and `--message`, plus three persistent local Codex tasks.
-- For replies, a compatible Codex MCP tool that can list live Claude sessions and send a message to the verified source session. This repo intentionally does not bundle an internal peer-socket transport.
+- For replies, install the bundled local Claude-peer MCP server in Codex. It needs access to the same user account's `~/.claude/sessions/` registry and peer sockets as Claude Code.
 - Python 3.10+ for the request helper. No Python packages are required.
 
 The current helper targets POSIX Claude peer sockets. Remote/cloud Codex tasks and Windows named pipes have not been validated.
@@ -26,7 +26,13 @@ The current helper targets POSIX Claude peer sockets. Remote/cloud Codex tasks a
 ## Set up
 
 1. Create three project-independent **local** Codex tasks. Use [OPERATOR_PROMPT.md](OPERATOR_PROMPT.md) as each one's initial instruction. Keep these tasks dedicated to operator work; their UUIDs are the stable destinations. Give them only the filesystem/tool access your workflow needs.
-2. Install a compatible local Claude-peer MCP bridge in Codex if you want direct replies to Claude. Check that Codex can list the source Claude session and message it. The request queue works independently of this reply channel.
+2. From this repository's root, register the included MCP bridge with Codex:
+
+   ```sh
+   codex mcp add claude_peers -- python3 "$(pwd)/mcp/claude_peers.py"
+   ```
+
+   Restart Codex so new tasks can load the tool, then check `codex mcp list`. If `claude_peers` is already registered to another working implementation, keep that registration and verify it exposes the same two tools. The request queue works without replies, but the complete workflow needs this bridge.
 3. Copy `skill/` to `~/.claude/skills/codex-operator-request/`.
 4. Create `~/.config/claude-codex-operator/config.json` using [config.example.json](config.example.json) and replace the three `thread_id` values with your task UUIDs. This file contains no secret.
 5. Add this optional line to your global Claude instructions if you want Claude to select the skill whenever it would ask you to do an operational step:
@@ -58,6 +64,10 @@ Run `python3 ~/.claude/skills/codex-operator-request/scripts/send_request.py --s
 
 This status represents **requests assigned by this helper**, not an independent measurement of Codex model activity. Keep the three tasks dedicated to this workflow. If a task crashes before release, it remains busy until its exact request is verified and released with `--finish WORKER_ID REQUEST_ID`. Never clear a busy assignment merely to force new work through.
 
+## Included reply bridge
+
+The bundled MCP server is a dependency-free Python stdio process. It lists local Claude session records, checks their PID and socket, and sends a result only when the requested PID and session UUID still match. The server sends one-way messages; use `expect_reply: false`. It does not provide a Codex inbox for Claude replies. On POSIX it connects to Claude's Unix peer socket. It reads the local peer token only at send time and never returns it through MCP. Claude's peer protocol is internal and may change; a completed socket write confirms delivery to the socket, not that Claude acted on the message.
+
 ## Operational rules
 
 - A queued-message ID confirms delivery to Codex, **not** successful execution. Codex must verify the end state before reporting success and release its assigned worker only afterward.
@@ -68,7 +78,7 @@ This status represents **requests assigned by this helper**, not an independent 
 
 ## What was tested
 
-The author tested the original queue and direct reply path on a local macOS setup: a live Claude Code session sent a request without manually supplying its identity; `codex queue` woke a Codex Desktop task; the task verified the source session and replied. The three-worker dispatcher was also tested locally: concurrent submissions selected distinct workers, all-busy requests were refused, and all three Codex tasks received a bridge-only request and released their assignments. The three-worker test used an intentionally unavailable synthetic Claude source, so it did not revalidate direct replies to a live Claude session. These tests did not change a project, account, or device. Other machines and bridge implementations need their own acceptance test.
+The author tested the original queue and direct reply path on a local macOS setup: a live Claude Code session sent a request without manually supplying its identity; `codex queue` woke a Codex Desktop task; the task verified the source session and replied through an already installed compatible MCP server. The three-worker dispatcher was also tested locally: concurrent submissions selected distinct workers, all-busy requests were refused, and all three Codex tasks received a bridge-only request and released their assignments. The bundled MCP server passed a local mock-socket test for tool discovery, session listing, identity mismatch rejection, and one-way delivery. It has **not** yet been validated against a live Claude session. These tests did not change a project, account, or device. Other machines and Claude versions need their own acceptance test.
 
 ## License
 
