@@ -1,0 +1,3 @@
+interface:
+  display_name: "Codex Operator Request"
+  short_description: "Route concrete operational requests to a dedicated Codex task"
