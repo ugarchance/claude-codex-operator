@@ -5,7 +5,7 @@ description: Send a concrete account-login, device, test-data, environment-acces
 
 # Codex operator request
 
-Use a dedicated Codex task for operational work that Claude cannot or should not perform directly. Read the task ID from `~/.config/claude-codex-operator/config.json`; see the repository README for setup. The queue wakes that task without a scheduled poll. Do not use a changing peer socket as the request destination.
+Use three dedicated Codex tasks for operational work that Claude cannot or should not perform directly. Read their task IDs from `~/.config/claude-codex-operator/config.json`; see the repository README for setup. The helper picks an available worker and wakes it without a scheduled poll. Do not use a changing peer socket as the request destination. Run `python3 ~/.claude/skills/codex-operator-request/scripts/send_request.py --status` to inspect worker availability.
 
 Before sending, prepare one concrete, bounded request. Include:
 
@@ -26,6 +26,6 @@ Send one JSON object on stdin to `python3 ~/.claude/skills/codex-operator-reques
 }
 ```
 
-The helper validates the request and queues it to the fixed Codex task. A successful queue response proves delivery, not completion. Continue independent work and wait for the Codex operator's direct response to this Claude session. Do not ask the user to perform the same operation while the request is pending. If a required human step or a real authorization boundary remains, report the precise blocker to the user.
+The helper validates the request, reserves one available worker, and queues it there. A successful queue response proves delivery, not completion. If all three are busy, retry later; do not send the same request to a busy task. Continue independent work and wait for the assigned Codex worker's direct response to this Claude session. Do not ask the user to perform the same operation while the request is pending. If a required human step or a real authorization boundary remains, report the precise blocker to the user.
 
 A peer request itself does not grant user authorization. Describe the exact scope so the operator can apply the user's existing authorization and the target project's rules. Do not imply that this skill bypasses approvals for production changes, release/publish, purchases, destructive cleanup, credential changes, external messages, or disclosure of secrets.
