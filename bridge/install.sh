@@ -34,7 +34,7 @@ if [ "$(uname -s)" = Darwin ]; then
   runner="$dest/agent-bridge-runner"
   if [ -x "$runner" ] && cmp -s "$here/runner.c" "$dest/runner.c"; then
     echo "runner unchanged: $runner"
-  elif xcode-select -p >/dev/null 2>&1 && cc -O2 -Wall -o "$runner.new" "$here/runner.c" \
+  elif xcode-select -p >/dev/null 2>&1 && cc -O2 -Wall -o "$runner.new" "$here/runner.c" -framework Security -framework CoreFoundation \
       && codesign --force --sign - --identifier agent-bridge-runner "$runner.new" 2>/dev/null; then
     mv -f "$runner.new" "$runner"
     cp "$here/runner.c" "$dest/runner.c"

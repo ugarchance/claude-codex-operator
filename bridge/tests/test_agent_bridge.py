@@ -4,6 +4,7 @@ Run: python3 bridge/tests/test_agent_bridge.py
 Set AGENT_BRIDGE_TEST_LAUNCHER=launchd (a logged-in Mac) or =task (Windows with a desktop logon) to exercise the
 desktop-session launchers instead of the direct one.
 """
+import base64
 import json
 import os
 import plistlib
@@ -27,8 +28,11 @@ def has_compiler():
     return sys.platform == 'darwin' and subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0
 
 
-def build_runner(path):
-    subprocess.run(['cc', '-O2', '-Wall', '-o', str(path), str(RUNNER_C)], check=True)
+def build_runner(path, allow_any=True):
+    # tests run fake agents: their runner builds accept any program; the installed runner only signed agent CLIs
+    flags = ['-DRUNNER_ALLOW_ANY'] if allow_any else []
+    subprocess.run(['cc', '-O2', '-Wall'] + flags + ['-o', str(path), str(RUNNER_C), '-framework', 'Security',
+                                                     '-framework', 'CoreFoundation'], check=True)
     return path
 
 
@@ -122,11 +126,11 @@ class BridgeTest(unittest.TestCase):
         thread = status['session']
         self.assertEqual(self.bridge('job', 'result', job)['result'], 'codex ok: görev')
         self.assertIn('codex://threads/' + thread, self.notes()[-1]['message'])
-        follow = self.bridge('send', 'codex', '--session', thread, '--prompt', 'ikinci')['job']
+        follow = self.bridge('send', 'codex', '--session', thread, '--prompt=--ikinci')['job']
         status2 = self.wait(follow)
         self.assertEqual(status2['state'], 'done', status2)
         self.assertEqual(status2['cwd'], os.path.realpath(str(self.project)))
-        self.assertEqual(self.bridge('job', 'result', follow)['result'], 'queued ok: ikinci')
+        self.assertEqual(self.bridge('job', 'result', follow)['result'], 'queued ok: --ikinci')  # not read as an option
 
     def test_notify_question_from_inside_a_job(self):
         self.env['AGENT_BRIDGE_JOB'] = '20261019-000000-abcd'
@@ -190,6 +194,10 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(dispatch('here', 'job', 'wait', job, '--timeout', '60')['state'], 'done')
         self.assertEqual(dispatch('here', 'job', 'result', job)['result'], 'codex ok: stdin ile görev')
         self.assertEqual(dispatch('machines')['routing'], 'mobil işler: here')
+        encoded = base64.urlsafe_b64encode(json.dumps(['job', 'show', 'x\u2019y']).encode()).decode()  # as dispatch sends it
+        decoded = json.loads(subprocess.run([sys.executable, str(self.bridge_path), '--argv-b64', encoded], capture_output=True,
+                                            encoding='utf-8', env=env, timeout=60).stdout)
+        self.assertEqual(decoded['error'], "invalid job id: 'x\u2019y'")
         self.assertEqual(dispatch('status')['here']['machine'], 'test')
         self.assertFalse(dispatch('nowhere', 'status')['ok'])
 
@@ -199,8 +207,22 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(dispatch.posix_word('~/Desktop/a b'), '"$HOME"\'/Desktop/a b\'')
         self.assertEqual(dispatch.posix_word("it's"), "'it'\"'\"'s'")
         self.assertEqual(dispatch.powershell_word("it's"), "'it''s'")
+        self.assertEqual(dispatch.powershell_word('Pro\u2019da \u2018x\u2019'), "'Pro\u2019\u2019da \u2018\u2018x\u2019\u2019'")
+        args = ['start', 'claude', '--cwd', '~/a b', '--name', 'Pro\u2019da "tırnak" & $(x)', '--model', '-x']
+        for shell in ('posix', 'powershell'):
+            remote = dispatch.remote_command({'shell': shell, 'python': 'py', 'bridge': 'b.py'}, args)
+            token = remote.rsplit(' ', 1)[-1]
+            self.assertRegex(token, r'^[A-Za-z0-9_=-]+$')
+            self.assertEqual(json.loads(base64.urlsafe_b64decode(token).decode('utf-8')), args)
         args, prompt = dispatch.split_prompt(['start', 'claude', '--prompt=merhaba', '--cwd', 'x'])
         self.assertEqual((args, prompt), (['start', 'claude', '--cwd', 'x'], 'merhaba'))
+
+    def test_job_folders_are_private(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX permissions')
+        self.bridge('job', 'list')
+        for folder in (self.root / 'state', self.root / 'state' / 'jobs'):
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
 
     def test_status_reports_fake_clis(self):
         info = self.bridge('status')
@@ -268,6 +290,18 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.run_runner('/nonexistent').returncode, 127)
         self.assertEqual(self.run_runner().returncode, 64)
         self.assertIn(self.run_runner('--check').returncode, (0, 1))
+
+    def test_installed_build_runs_only_signed_agent_clis(self):
+        strict = str(build_runner(self.dir / 'strict-runner', allow_any=False))
+        refused = subprocess.run([strict, '/bin/echo', 'x'], capture_output=True, text=True, timeout=60)
+        self.assertEqual(refused.returncode, 126, refused.stderr)
+        self.assertIn('not signed by an allowed developer team', refused.stderr)
+        self.assertEqual(subprocess.run([strict, 'echo', 'x'], capture_output=True, timeout=60).returncode, 127)
+        claude = shutil.which('claude') or os.path.expanduser('~/.local/bin/claude')
+        if os.path.exists(claude):  # a real, signed Claude Code: started, prints its version (no model call)
+            result = subprocess.run([strict, claude, '--version'], capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('Claude Code', result.stdout)
 
     def test_forwards_termination_to_the_agent(self):
         marker = self.dir / 'child.pid'

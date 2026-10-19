@@ -36,6 +36,16 @@ def claude(args):
     return 1 if error else 0
 
 
+def option(args, name):
+    """Value of `--name VALUE` or `--name=VALUE`, as clap accepts both."""
+    for i, arg in enumerate(args):
+        if arg == name:
+            return args[i + 1]
+        if arg.startswith(name + '='):
+            return arg[len(name) + 1:]
+    raise SystemExit('missing ' + name)
+
+
 def rollout_for(thread):
     root = Path(os.environ['CODEX_HOME']) / 'sessions' / '2026' / '10' / '19'
     root.mkdir(parents=True, exist_ok=True)
@@ -50,7 +60,7 @@ def codex(args):
         if args[1:2] == ['--help']:
             print('Usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>')
             return 0
-        thread, message = args[args.index('--thread') + 1], args[args.index('--message') + 1]
+        thread, message = option(args, '--thread'), option(args, '--message')
         with open(str(rollout_for(thread)), 'a', encoding='utf-8') as handle:
             handle.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started'}}) + '\n')
             handle.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete', 'last_agent_message': 'queued ok: ' + message}}) + '\n')

@@ -8,10 +8,19 @@
  *   agent-bridge-runner PROGRAM [ARGS...]   run PROGRAM, forward SIGTERM/SIGINT/SIGHUP, exit the way it exited
  *   agent-bridge-runner --check             exit 0 when this process holds Full Disk Access, 1 when it does not
  *
- * Build: cc -O2 -Wall -o agent-bridge-runner runner.c && codesign --force --sign - agent-bridge-runner
+ * The runner is no more powerful than a grant given to the agent CLIs themselves: PROGRAM must be an absolute path to
+ * a binary signed by one of RUNNER_TEAMS (Developer ID team identifiers; default Anthropic and OpenAI), checked on
+ * the resolved file before it is started. Exit 126 when it is not.
+ *
+ * Build: cc -O2 -Wall -o agent-bridge-runner runner.c -framework Security -framework CoreFoundation
+ *        && codesign --force --sign - agent-bridge-runner
+ * Tests build with -DRUNNER_ALLOW_ANY (a separate binary that never holds a grant).
  */
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -20,7 +29,41 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef RUNNER_TEAMS
+#define RUNNER_TEAMS "Q6L2SF6YDW 2DC432GLL2" /* Anthropic PBC, OpenAI OpCo */
+#endif
+
 extern char **environ;
+
+static int signed_by_allowed_team(const char *path) {
+#ifdef RUNNER_ALLOW_ANY
+    (void)path;
+    return 1;
+#else
+    int ok = 0;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path, (CFIndex)strlen(path), false);
+    SecStaticCodeRef code = NULL;
+    if (url && SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess) {
+        char teams[] = RUNNER_TEAMS;
+        char *save = NULL;
+        for (char *team = strtok_r(teams, " ", &save); team && !ok; team = strtok_r(NULL, " ", &save)) {
+            CFStringRef text = CFStringCreateWithFormat(kCFAllocatorDefault, NULL,
+                                                        CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"%s\""), team);
+            SecRequirementRef requirement = NULL;
+            if (text && SecRequirementCreateWithString(text, kSecCSDefaultFlags, &requirement) == errSecSuccess) {
+                ok = SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures, requirement) == errSecSuccess;
+                CFRelease(requirement);
+            }
+            if (text)
+                CFRelease(text);
+        }
+        CFRelease(code);
+    }
+    if (url)
+        CFRelease(url);
+    return ok;
+#endif
+}
 static volatile pid_t child = 0;
 
 static void forward(int sig) {
@@ -56,6 +99,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: agent-bridge-runner PROGRAM [ARGS...] | --check\n");
         return 64;
     }
+    char program[PATH_MAX];
+    if (argv[1][0] != '/' || !realpath(argv[1], program)) {
+        fprintf(stderr, "agent-bridge-runner: %s: needs the absolute path of an existing program\n", argv[1]);
+        return 127;
+    }
+    if (!signed_by_allowed_team(program)) {
+        fprintf(stderr, "agent-bridge-runner: %s: not signed by an allowed developer team\n", program);
+        return 126;
+    }
     const int sigs[] = {SIGTERM, SIGINT, SIGHUP};
     sigset_t block, old, defaults;
     sigemptyset(&block);
@@ -77,10 +129,10 @@ int main(int argc, char **argv) {
     posix_spawnattr_setsigdefault(&attr, &defaults);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
     pid_t pid;
-    int rc = posix_spawnp(&pid, argv[1], NULL, &attr, argv + 1, environ);
+    int rc = posix_spawn(&pid, program, NULL, &attr, argv + 1, environ);
     posix_spawnattr_destroy(&attr);
     if (rc != 0) {
-        fprintf(stderr, "agent-bridge-runner: %s: %s\n", argv[1], strerror(rc));
+        fprintf(stderr, "agent-bridge-runner: %s: %s\n", program, strerror(rc));
         return 127;
     }
     child = pid;

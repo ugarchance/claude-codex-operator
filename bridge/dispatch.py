@@ -22,6 +22,7 @@ Machines live in machines.json (AGENT_BRIDGE_MACHINES, else %APPDATA%\\agent-bri
 `routing` (optional) is printed by `dispatch.py machines`, so an agent learns the owner's placement rules first.
 Python 3.9+, standard library only.
 """
+import base64
 import json
 import os
 import re
@@ -76,7 +77,23 @@ def posix_word(value):
 
 
 def powershell_word(value):
-    return "'" + value.replace("'", "''") + "'"
+    # PowerShell also ends a single-quoted string at the typographic quotes; double every variant
+    return "'" + re.sub("(['‘’‚‛])", r'\1\1', value) + "'"
+
+
+def encode_args(args):
+    """Bridge arguments as one shell-inert word (base64url of a JSON list), decoded by agent_bridge.py --argv-b64.
+
+    No argument passes through remote shell quoting, so quotes, spaces or a leading '-' arrive unchanged on every
+    platform (Windows PowerShell 5.1 would otherwise re-split arguments that contain double quotes)."""
+    return base64.urlsafe_b64encode(json.dumps(args, ensure_ascii=False).encode('utf-8')).decode('ascii')
+
+
+def remote_command(machine, args):
+    python, bridge = machine.get('python') or 'python3', machine['bridge']
+    if machine.get('shell') == 'powershell':
+        return '& %s %s --argv-b64 %s' % (powershell_word(python), powershell_word(bridge), encode_args(args))
+    return '%s %s --argv-b64 %s' % (posix_word(python), posix_word(bridge), encode_args(args))
 
 
 def split_prompt(args):
@@ -122,10 +139,7 @@ def run_on(name, machine, args, prompt, timeout=None):
     if machine.get('local'):
         argv = [os.path.expanduser(python), os.path.expanduser(bridge)] + args
     else:
-        if machine.get('shell') == 'powershell':
-            remote = '& ' + ' '.join(powershell_word(part) for part in [python, bridge] + args)
-        else:
-            remote = ' '.join(posix_word(part) for part in [python, bridge] + args)
+        remote = remote_command(machine, args)
         no_stdin = [] if stdin is not None else ['-n']  # Windows OpenSSH can hang on an idle stdin without -n
         argv = [ssh_binary()] + SSH_OPTIONS + no_stdin + machine.get('ssh_options', []) + [machine.get('ssh') or name, remote]
     # Windows OpenSSH stalls when its stdout is a pipe from Python and never forwards EOF from a stdin pipe:

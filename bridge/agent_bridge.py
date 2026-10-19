@@ -72,6 +72,10 @@ def state_dir():
 def jobs_dir():
     path = state_dir() / 'jobs'
     path.mkdir(parents=True, exist_ok=True)
+    if not IS_WIN:  # prompts and results are private: the folders are the owner's only (Windows: the profile ACL)
+        for folder in (state_dir(), path):
+            if folder.stat().st_mode & 0o077:
+                os.chmod(str(folder), 0o700)
     return path
 
 
@@ -656,7 +660,9 @@ def run_codex_queue(cfg, req, jd, prompt):
     if not base or not rollout:
         return {'state': 'failed', 'error': 'codex CLI or rollout for thread %s not found' % thread}
     offset = rollout.stat().st_size
-    queued = subprocess.run(base + ['queue', '--thread', thread, '--message', prompt], capture_output=True, text=True,
+    # `codex queue` takes the message only as an argument; the `=` form keeps a leading '-' from reading as an option.
+    # The text is on that short-lived process's command line (see README, Security).
+    queued = subprocess.run(base + ['queue', '--thread=' + thread, '--message=' + prompt], capture_output=True, text=True,
                             encoding='utf-8', errors='replace', creationflags=NO_WINDOW)
     if queued.returncode != 0:
         return {'state': 'failed', 'error': 'codex queue: ' + (queued.stderr or queued.stdout).strip()[:300]}
@@ -1007,6 +1013,16 @@ def cmd_status(args, cfg):
     emit(info)
 
 
+def decode_args(token):
+    try:
+        args = json.loads(base64.urlsafe_b64decode(token.encode('ascii')).decode('utf-8'))
+    except (ValueError, UnicodeError):
+        args = None
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        fail('invalid --argv-b64 value')
+    return args
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='agent-bridge', description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='command', required=True)
@@ -1045,6 +1061,9 @@ def main(argv=None):
     p.add_argument('job')
     p.add_argument('--state')
     p.add_argument('--config')
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['--argv-b64']:  # dispatch.py sends remote arguments as one shell-inert word
+        argv = decode_args(argv[1] if len(argv) > 1 else '')
     args = parser.parse_args(argv)
     if args.command == '_run':  # the launcher passes the dispatcher-side locations explicitly
         if args.state:

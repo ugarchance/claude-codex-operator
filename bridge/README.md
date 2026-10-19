@@ -110,7 +110,10 @@ On machines whose agents should dispatch work, install the skill: copy `bridge/s
 - The bridge runs whatever prompt it receives with your accounts. Only expose it to dispatchers you trust (SSH keys, a firewall that limits who can reach SSH).
 - Session ids are validated (`[0-9A-Za-z_-]`, 8–80 characters) before they reach a command line; Windows `cmd /c start` gets them as separate arguments.
 - `bypassPermissions` is refused unless the machine's own config opts in.
-- Job folders contain the prompt and the agent's output. They are created with your user's default permissions.
+- Job folders contain the prompt and the agent's output. On macOS and Linux the state and jobs folders are kept at mode 0700; on Windows they live in the user profile.
+- `dispatch.py` sends a remote machine's bridge arguments as one base64url-encoded word (`--argv-b64`), never through remote shell quoting, so quotes, spaces or a leading `-` in a value arrive unchanged. Prompts travel on stdin.
+- `codex queue` accepts the message only as an argument, so for a follow-up into a Codex app thread the text is on the command line of that short-lived process. The bridge passes it as `--message=TEXT`, so it is never read as an option.
+- The privacy runner starts only binaries signed by the developer teams compiled into it (`RUNNER_TEAMS`; default Anthropic and OpenAI) and only by absolute path. Granting it Full Disk Access is therefore equivalent to granting that access to the Claude Code and Codex CLIs themselves.
 
 ## Tests
 
