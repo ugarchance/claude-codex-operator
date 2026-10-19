@@ -80,6 +80,10 @@ The bundled MCP server is a dependency-free Python stdio process. It lists local
 
 The author tested the original queue and direct reply path on a local macOS setup: a live Claude Code session sent a request without manually supplying its identity; `codex queue` woke a Codex Desktop task; the task verified the source session and replied through an already installed compatible MCP server. The three-worker dispatcher was also tested locally: concurrent submissions selected distinct workers, all-busy requests were refused, and all three Codex tasks received a bridge-only request and released their assignments. The bundled MCP server passed a local mock-socket test for tool discovery, session listing, identity mismatch rejection, and one-way delivery. It has **not** yet been validated against a live Claude session. These tests did not change a project, account, or device. Other machines and Claude versions need their own acceptance test.
 
+## Cross-machine agent bridge
+
+[`bridge/`](bridge/README.md) starts and continues Claude Code and Codex sessions on any of your machines from one dispatcher: a chat agent you message from your phone, or a Claude/Codex session on another computer. Jobs run inside the logged-in desktop session (launchd on macOS, Task Scheduler on Windows). Finished sessions can be handed to Claude Desktop or the Codex app so you continue them there, and each result, or a question from the agent, goes back through a return command you configure. The [`agent-request` skill](bridge/skill/SKILL.md) teaches Claude and Codex to use it. See the [bridge README](bridge/README.md) for setup, macOS privacy notes and tests.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
