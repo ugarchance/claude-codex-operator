@@ -291,15 +291,24 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.run_runner().returncode, 64)
         self.assertIn(self.run_runner('--check').returncode, (0, 1))
 
+    def test_removes_code_loading_variables(self):
+        env = dict(os.environ, NODE_OPTIONS='--x', BUN_OPTIONS='--y', PYTHONPATH='/z', ELECTRON_RUN_AS_NODE='1', KEEP_ME='1')
+        out = subprocess.run([self.runner, '/usr/bin/env'], capture_output=True, text=True, env=env, timeout=30).stdout
+        self.assertIn('KEEP_ME=1', out)
+        for name in ('NODE_OPTIONS', 'BUN_OPTIONS', 'PYTHONPATH', 'ELECTRON_RUN_AS_NODE'):
+            self.assertNotIn(name + '=', out)
+
     def test_installed_build_runs_only_signed_agent_clis(self):
         strict = str(build_runner(self.dir / 'strict-runner', allow_any=False))
+        subprocess.run(['codesign', '--force', '--sign', '-', '--options', 'runtime', strict], capture_output=True, check=True)
         refused = subprocess.run([strict, '/bin/echo', 'x'], capture_output=True, text=True, timeout=60)
         self.assertEqual(refused.returncode, 126, refused.stderr)
-        self.assertIn('not signed by an allowed developer team', refused.stderr)
+        self.assertIn('not an allowed agent CLI', refused.stderr)
         self.assertEqual(subprocess.run([strict, 'echo', 'x'], capture_output=True, timeout=60).returncode, 127)
         claude = shutil.which('claude') or os.path.expanduser('~/.local/bin/claude')
         if os.path.exists(claude):  # a real, signed Claude Code: started, prints its version (no model call)
-            result = subprocess.run([strict, claude, '--version'], capture_output=True, text=True, timeout=120)
+            env = dict(os.environ, DYLD_INSERT_LIBRARIES='/nonexistent')  # ignored for the hardened runner, removed for the agent
+            result = subprocess.run([strict, claude, '--version'], capture_output=True, text=True, env=env, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Claude Code', result.stdout)
 

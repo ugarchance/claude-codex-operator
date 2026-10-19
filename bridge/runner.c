@@ -8,12 +8,14 @@
  *   agent-bridge-runner PROGRAM [ARGS...]   run PROGRAM, forward SIGTERM/SIGINT/SIGHUP, exit the way it exited
  *   agent-bridge-runner --check             exit 0 when this process holds Full Disk Access, 1 when it does not
  *
- * The runner is no more powerful than a grant given to the agent CLIs themselves: PROGRAM must be an absolute path to
- * a binary signed by one of RUNNER_TEAMS (Developer ID team identifiers; default Anthropic and OpenAI), checked on
- * the resolved file before it is started. Exit 126 when it is not.
+ * The runner is no more powerful than a grant given to the agent CLIs themselves:
+ * - PROGRAM must be an absolute path. It is started suspended, and it runs only if the code of that very process is
+ *   signed with one of RUNNER_AGENTS ("signing-identifier:team-identifier" pairs; default Claude Code and the Codex
+ *   CLI). Otherwise the process is killed before it runs and the runner exits 126.
+ * - Environment variables that make a runtime load foreign code (DYLD_*, NODE_OPTIONS, BUN_*, ...) are removed.
  *
  * Build: cc -O2 -Wall -o agent-bridge-runner runner.c -framework Security -framework CoreFoundation
- *        && codesign --force --sign - agent-bridge-runner
+ *        && codesign --force --sign - --options runtime agent-bridge-runner   (hardened: dyld ignores DYLD_* for it)
  * Tests build with -DRUNNER_ALLOW_ANY (a separate binary that never holds a grant).
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -29,41 +31,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#ifndef RUNNER_TEAMS
-#define RUNNER_TEAMS "Q6L2SF6YDW 2DC432GLL2" /* Anthropic PBC, OpenAI OpCo */
+#ifndef RUNNER_AGENTS
+#define RUNNER_AGENTS "com.anthropic.claude-code:Q6L2SF6YDW codex:2DC432GLL2" /* Anthropic PBC, OpenAI OpCo */
 #endif
 
 extern char **environ;
-
-static int signed_by_allowed_team(const char *path) {
-#ifdef RUNNER_ALLOW_ANY
-    (void)path;
-    return 1;
-#else
-    int ok = 0;
-    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path, (CFIndex)strlen(path), false);
-    SecStaticCodeRef code = NULL;
-    if (url && SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess) {
-        char teams[] = RUNNER_TEAMS;
-        char *save = NULL;
-        for (char *team = strtok_r(teams, " ", &save); team && !ok; team = strtok_r(NULL, " ", &save)) {
-            CFStringRef text = CFStringCreateWithFormat(kCFAllocatorDefault, NULL,
-                                                        CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"%s\""), team);
-            SecRequirementRef requirement = NULL;
-            if (text && SecRequirementCreateWithString(text, kSecCSDefaultFlags, &requirement) == errSecSuccess) {
-                ok = SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures, requirement) == errSecSuccess;
-                CFRelease(requirement);
-            }
-            if (text)
-                CFRelease(text);
-        }
-        CFRelease(code);
-    }
-    if (url)
-        CFRelease(url);
-    return ok;
-#endif
-}
 static volatile pid_t child = 0;
 
 static void forward(int sig) {
@@ -92,6 +64,86 @@ static int check(void) {
     return denied ? 1 : 2;
 }
 
+#ifndef RUNNER_ALLOW_ANY
+/* Whether code (a file on disk, or a running process when `running`) satisfies one of RUNNER_AGENTS. */
+static int satisfies_agents(SecStaticCodeRef code, int running) {
+    int ok = 0;
+    char agents[] = RUNNER_AGENTS;
+    char *save = NULL;
+    for (char *pair = strtok_r(agents, " ", &save); pair && !ok; pair = strtok_r(NULL, " ", &save)) {
+        char *team = strchr(pair, ':');
+        if (!team)
+            continue;
+        *team++ = '\0';
+        CFStringRef text = CFStringCreateWithFormat(
+            kCFAllocatorDefault, NULL,
+            CFSTR("identifier \"%s\" and anchor apple generic and certificate leaf[subject.OU] = \"%s\""), pair, team);
+        SecRequirementRef requirement = NULL;
+        if (text && SecRequirementCreateWithString(text, kSecCSDefaultFlags, &requirement) == errSecSuccess) {
+            OSStatus status = running ? SecCodeCheckValidity((SecCodeRef)code, kSecCSDefaultFlags, requirement)
+                                      : SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures, requirement);
+            ok = status == errSecSuccess;
+            CFRelease(requirement);
+        }
+        if (text)
+            CFRelease(text);
+    }
+    return ok;
+}
+#endif
+
+static int file_allowed(const char *path) { /* early, friendly refusal; the process check below decides */
+#ifdef RUNNER_ALLOW_ANY
+    (void)path;
+    return 1;
+#else
+    int ok = 0;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path, (CFIndex)strlen(path), false);
+    SecStaticCodeRef code = NULL;
+    if (url && SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess) {
+        ok = satisfies_agents(code, 0);
+        CFRelease(code);
+    }
+    if (url)
+        CFRelease(url);
+    return ok;
+#endif
+}
+
+static int process_allowed(pid_t pid) { /* the code of the suspended child itself: what is checked is what runs */
+#ifdef RUNNER_ALLOW_ANY
+    (void)pid;
+    return 1;
+#else
+    int ok = 0, value = pid;
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+    const void *keys[] = {kSecGuestAttributePid};
+    const void *values[] = {number};
+    CFDictionaryRef attributes = number ? CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                             &kCFTypeDictionaryValueCallBacks)
+                                        : NULL;
+    SecCodeRef code = NULL;
+    if (attributes && SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &code) == errSecSuccess) {
+        ok = satisfies_agents((SecStaticCodeRef)code, 1);
+        CFRelease(code);
+    }
+    if (attributes)
+        CFRelease(attributes);
+    if (number)
+        CFRelease(number);
+    return ok;
+#endif
+}
+
+static int loads_foreign_code(const char *entry) {
+    static const char *prefixes[] = {"DYLD_", "LD_", "ELECTRON_", "BUN_", "PYTHON", "PERL5", "NODE_OPTIONS=", "NODE_PATH=",
+                                     "RUBYOPT="};
+    for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++)
+        if (strncmp(entry, prefixes[i], strlen(prefixes[i])) == 0)
+            return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--check") == 0)
         return check();
@@ -104,10 +156,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "agent-bridge-runner: %s: needs the absolute path of an existing program\n", argv[1]);
         return 127;
     }
-    if (!signed_by_allowed_team(program)) {
-        fprintf(stderr, "agent-bridge-runner: %s: not signed by an allowed developer team\n", program);
+    if (!file_allowed(program)) {
+        fprintf(stderr, "agent-bridge-runner: %s: not an allowed agent CLI (signing identity)\n", program);
         return 126;
     }
+    size_t count = 0;
+    while (environ[count])
+        count++;
+    char **env = calloc(count + 1, sizeof *env);
+    if (!env)
+        return 1;
+    for (size_t i = 0, n = 0; i < count; i++)
+        if (!loads_foreign_code(environ[i]))
+            env[n++] = environ[i];
+
     const int sigs[] = {SIGTERM, SIGINT, SIGHUP};
     sigset_t block, old, defaults;
     sigemptyset(&block);
@@ -127,17 +189,25 @@ int main(int argc, char **argv) {
     posix_spawnattr_init(&attr);
     posix_spawnattr_setsigmask(&attr, &old);
     posix_spawnattr_setsigdefault(&attr, &defaults);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_START_SUSPENDED);
     pid_t pid;
-    int rc = posix_spawn(&pid, program, NULL, &attr, argv + 1, environ);
+    int rc = posix_spawn(&pid, program, NULL, &attr, argv + 1, env);
     posix_spawnattr_destroy(&attr);
+    free(env);
     if (rc != 0) {
         fprintf(stderr, "agent-bridge-runner: %s: %s\n", program, strerror(rc));
         return 127;
     }
-    child = pid;
-    sigprocmask(SIG_SETMASK, &old, NULL);
     int status;
+    if (!process_allowed(pid)) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        fprintf(stderr, "agent-bridge-runner: %s: the started code is not an allowed agent CLI\n", program);
+        return 126;
+    }
+    child = pid;
+    kill(pid, SIGCONT);
+    sigprocmask(SIG_SETMASK, &old, NULL);
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             perror("agent-bridge-runner: waitpid");
